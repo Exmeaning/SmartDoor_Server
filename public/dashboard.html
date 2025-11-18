@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>K230 远程控制台</title>
+  <style>
+    body { font-family: system-ui; margin: 20px; background: #f4f4f4; }
+    .log { background: #fff; padding: 10px; height: 60vh; overflow-y: auto; border: 1px solid #ddd; }
+    .event { margin: 4px 0; padding: 8px; background: #eef; border-radius: 4px; }
+    .access_granted { background: #e6f7e6 !important; }
+    .access_denied { background: #fce8e6 !important; }
+    button { padding: 10px 20px; margin: 5px; font-size: 16px; }
+  </style>
+</head>
+<body>
+  <h1>K230 自动开门机 远程控制台</h1>
+  <div>
+    <input id="token" placeholder="Bearer Token" style="width:400px;padding:10px;font-size:16px;" value="550e8400-e29b-41d4-a716-446655440000">
+    <input id="device_id" placeholder="设备ID，如 K230_001" value="K230_001" style="width:200px;padding:10px;">
+  </div>
+  <div style="margin:20px 0;">
+    <button onclick="openDoor(5)">开门 5秒</button>
+    <button onclick="openDoor(10)">开门 10秒</button>
+    <button onclick="emergencyOpen()">紧急开门</button>
+    <button onclick="reboot()">重启设备</button>
+    <button onclick="getStatus()">获取状态</button>
+  </div>
+  <h3>实时事件流</h3>
+  <div id="log" class="log"></div>
+
+  <script>
+    const token = () => document.getElementById('token').value.trim();
+    const device_id = () => document.getElementById('device_id').value.trim();
+    let last_ts = 0;
+
+    const log = document.getElementById('log');
+    const addEvent = (ev) => {
+      const div = document.createElement('div');
+      div.className = `event ${ev.event_type || ''}`;
+      div.textContent = `[${new Date(ev.timestamp * 1000).toLocaleString()}] ${ev.event_type} - ${ev.device_id || ''} ${JSON.stringify(ev.data || {})}`;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+    };
+
+    // 发送命令
+    const sendCommand = async (cmd, params = {}) => {
+      await fetch('/api/command', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + token(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: device_id(), command: cmd, params })
+      });
+    };
+    const openDoor = (sec) => sendCommand('open_door', { duration: sec });
+    const emergencyOpen = () => sendCommand('emergency_open', { duration: 30 });
+    const reboot = () => sendCommand('reboot', { delay: 3 });
+    const getStatus = () => sendCommand('get_status');
+
+    // 轮询事件
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/sender/poll?last_timestamp=${last_ts}`, {
+          headers: { 'Authorization': 'Bearer ' + token() }
+        });
+        const json = await res.json();
+        if (json.data && json.data.length) {
+          json.data.forEach(addEvent);
+          last_ts = json.latest_timestamp;
+        }
+      } catch (e) { console.error(e); }
+      setTimeout(poll, 1000);
+    };
+
+    poll();
+  </script>
+</body>
+</html>

@@ -22,14 +22,14 @@ import (
 
 // --- 配置结构 ---
 type Config struct {
-	Port           string
-	DeviceToken    string
-	UserToken      string
-	APIToken       string
-	R2AccountID    string
-	R2AccessKey    string
-	R2SecretKey    string
-	R2BucketName   string
+	Port         string
+	DeviceToken  string
+	UserToken    string
+	APIToken     string
+	R2AccountID  string
+	R2AccessKey  string
+	R2SecretKey  string
+	R2BucketName string
 }
 
 // --- 数据模型 ---
@@ -39,27 +39,29 @@ type LogEntry struct {
 	Type   string    `json:"type"`
 	Msg    string    `json:"msg"`
 	ImgURL *string   `json:"imgUrl"`
-	R2Key  string    `json:"-"` // 不导出给 JSON
+	R2Key  string    `json:"-"`
 }
 
 type DeviceStatus struct {
 	Connected bool   `json:"connected"`
 	Camera    bool   `json:"camera"`
-	Door      string `json:"door"` // OPEN, CLOSED, UNKNOWN
+	Door      string `json:"door"`
 }
 
-// --- 全局变量 (加锁保护) ---
+// --- 全局变量 ---
 var (
-	cfg          Config
-	logs         []LogEntry
-	logMutex     sync.RWMutex
-	deviceStatus DeviceStatus
-	statusMutex  sync.RWMutex
-	s3Client     *s3.Client
+	cfg           Config
+	logs          []LogEntry
+	logMutex      sync.RWMutex
+	deviceStatus  DeviceStatus
+	statusMutex   sync.RWMutex
+	s3Client      *s3.Client
 	presignClient *s3.PresignClient
+	
+	// 用 sync.Map 替代 s.Set/Get 来存储 socket 类型
+	socketMeta    sync.Map // map[SocketID]string ("device" or "web")
 )
 
-// HTML 字符串 (保持你的前端完全不变)
 const HTML_CONTENT = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -76,10 +78,6 @@ const HTML_CONTENT = `
         .log-scroll::-webkit-scrollbar { width: 6px; }
         .log-scroll::-webkit-scrollbar-track { background: #262626; }
         .log-scroll::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
-        .fade-enter-active, .fade-leave-active { transition: opacity 0.3s ease; }
-        .fade-enter-from, .fade-leave-to { opacity: 0; }
-        .list-enter-active, .list-leave-active { transition: all 0.4s ease; }
-        .list-enter-from, .list-leave-to { opacity: 0; transform: translateY(-20px); }
     </style>
 </head>
 <body class="h-screen w-screen overflow-hidden flex flex-col">
@@ -173,27 +171,23 @@ const HTML_CONTENT = `
 `
 
 func init() {
-	// 加载环境变量
 	cfg = Config{
-		Port:           getEnv("PORT", "3000"),
-		DeviceToken:    getEnv("DEVICE_TOKEN", "default_device_token"),
-		UserToken:      getEnv("USER_TOKEN", "default_user_token"),
-		APIToken:       getEnv("API_TOKEN", "external_secret_999"),
-		R2AccountID:    getEnv("R2_ACCOUNT_ID", ""),
-		R2AccessKey:    getEnv("R2_ACCESS_KEY_ID", ""),
-		R2SecretKey:    getEnv("R2_SECRET_ACCESS_KEY", ""),
-		R2BucketName:   getEnv("R2_BUCKET_NAME", ""),
+		Port:         getEnv("PORT", "3000"),
+		DeviceToken:  getEnv("DEVICE_TOKEN", "default_device_token"),
+		UserToken:    getEnv("USER_TOKEN", "default_user_token"),
+		APIToken:     getEnv("API_TOKEN", "external_secret_999"),
+		R2AccountID:  getEnv("R2_ACCOUNT_ID", ""),
+		R2AccessKey:  getEnv("R2_ACCESS_KEY_ID", ""),
+		R2SecretKey:  getEnv("R2_SECRET_ACCESS_KEY", ""),
+		R2BucketName: getEnv("R2_BUCKET_NAME", ""),
 	}
 	deviceStatus.Door = "UNKNOWN"
 
-	// 初始化 S3/R2
 	if cfg.R2AccountID != "" && cfg.R2AccessKey != "" {
 		r2Endpoint := fmt.Sprintf("https://%s.r2.cloudflarestorage.com", cfg.R2AccountID)
-		
 		resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
 			return aws.Endpoint{URL: r2Endpoint}, nil
 		})
-
 		awsCfg, err := config.LoadDefaultConfig(context.TODO(),
 			config.WithEndpointResolverWithOptions(resolver),
 			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.R2AccessKey, cfg.R2SecretKey, "")),
@@ -210,38 +204,55 @@ func init() {
 }
 
 func main() {
-	// Socket.io Server
 	io := socket.NewServer(nil, nil)
 
 	// 中间件鉴权
 	io.Use(func(s *socket.Socket, next func(*socket.ExtendedError)) {
-		// 获取 Auth Payload
-		// Go库获取方式略有不同，需要转类型
-		auth := s.Handshake().Auth
+		// 1. 使用类型断言安全获取 auth
+		authData := s.Handshake().Auth
+		var auth map[string]interface{}
+		
+		// authData 可能是 map[string]interface{} 或者其他
+		if m, ok := authData.(map[string]interface{}); ok {
+			auth = m
+		} else {
+			// 尝试从 JSON 转换 (有时候库会给 map[string]any)
+			// 简单处理：如果是 nil，就初始化空 map
+			auth = make(map[string]interface{})
+		}
+
 		var token string
 		var clientType string
 
 		if t, ok := auth["token"].(string); ok { token = t }
 		if tp, ok := auth["type"].(string); ok { clientType = tp }
 
-		// 鉴权逻辑
 		if clientType == "device" && token == cfg.DeviceToken {
-			s.Set("type", "device")
+			socketMeta.Store(s.Id(), "device")
 			next(nil)
 			return
 		}
 		if clientType == "web" && token == cfg.UserToken {
-			s.Set("type", "web")
+			socketMeta.Store(s.Id(), "web")
 			next(nil)
 			return
 		}
-		// 鉴权失败
-		err := socket.NewExtendedError("Authentication error", nil)
-		next(err)
+		
+		// 打印调试信息方便排查
+		log.Printf("Auth failed. Type: %s, Token: %s", clientType, token)
+		next(socket.NewExtendedError("Authentication error", nil))
 	})
 
-	io.On("connection", func(s *socket.Socket) {
-		clientType, _ := s.Get("type")
+	// 连接事件 (注意：zishang520库的事件回调签名必须是 func(...any))
+	io.On("connection", func(args ...any) {
+		if len(args) == 0 { return }
+		s, ok := args[0].(*socket.Socket)
+		if !ok { return }
+
+		// 从 sync.Map 获取类型
+		typeVal, _ := socketMeta.Load(s.Id())
+		clientType, _ := typeVal.(string)
+
 		log.Printf("Client connected: %v (%v)", clientType, s.Id())
 
 		if clientType == "device" {
@@ -252,7 +263,9 @@ func main() {
 			})
 			io.To("web_room").Emit("status", deviceStatus)
 
-			s.On("disconnect", func(reason string) {
+			// 断开连接
+			s.On("disconnect", func(args ...any) {
+				socketMeta.Delete(s.Id())
 				updateDeviceStatus(func(ds *DeviceStatus) {
 					ds.Connected = false
 					ds.Camera = false
@@ -260,15 +273,24 @@ func main() {
 				io.To("web_room").Emit("status", deviceStatus)
 			})
 
-			s.On("door_status", func(status string) {
-				updateDeviceStatus(func(ds *DeviceStatus) {
-					ds.Door = status
-				})
-				io.To("web_room").Emit("status", deviceStatus)
+			// 门状态更新
+			s.On("door_status", func(args ...any) {
+				if len(args) > 0 {
+					if status, ok := args[0].(string); ok {
+						updateDeviceStatus(func(ds *DeviceStatus) {
+							ds.Door = status
+						})
+						io.To("web_room").Emit("status", deviceStatus)
+					}
+				}
 			})
 
-			s.On("report", func(data map[string]interface{}) {
-				// data: {type, msg, image}
+			// 日志上报
+			s.On("report", func(args ...any) {
+				if len(args) == 0 { return }
+				data, ok := args[0].(map[string]interface{})
+				if !ok { return }
+
 				logType, _ := data["type"].(string)
 				msg, _ := data["msg"].(string)
 				imgBase64, _ := data["image"].(string)
@@ -280,7 +302,7 @@ func main() {
 					Msg:  msg,
 				}
 
-				// 1. 实时转发 Base64 到 Web
+				// 实时 Base64
 				var realtimeImg *string
 				if imgBase64 != "" {
 					if !strings.HasPrefix(imgBase64, "data:") {
@@ -294,13 +316,13 @@ func main() {
 
 				io.To("web_room").Emit("log", entry)
 
-				// 2. 异步上传 R2
+				// 异步 R2
 				go func(e LogEntry, b64 string) {
 					if b64 != "" {
 						key := uploadToR2(b64)
 						if key != "" {
 							e.R2Key = key
-							e.ImgURL = nil // 内存中不存 Base64
+							e.ImgURL = nil
 							addLog(e)
 						}
 					} else {
@@ -313,32 +335,36 @@ func main() {
 		if clientType == "web" {
 			s.Join("web_room")
 			s.Emit("status", deviceStatus)
-			
-			// 发送历史日志
 			sendHistoryLogs(s)
 
-			s.On("command", func(data map[string]interface{}) {
+			// 接收指令
+			s.On("command", func(args ...any) {
+				if len(args) == 0 { return }
+				data, ok := args[0].(map[string]interface{})
+				if !ok { return }
+				
 				cmd, _ := data["cmd"].(string)
 				log.Printf("Command received: %s", cmd)
 				io.To("device_room").Emit("command", map[string]string{"cmd": cmd})
 			})
+			
+			// 清理 Map
+			s.On("disconnect", func(args ...any) {
+				socketMeta.Delete(s.Id())
+			})
 		}
 	})
 
-	// HTTP 路由
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(HTML_CONTENT))
 	})
 
-	// 第三方 API 接口
 	http.HandleFunc("/api/command", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-
-		// 鉴权
 		token := r.Header.Get("Authorization")
 		if token == "" {
 			token = r.URL.Query().Get("token")
@@ -350,7 +376,6 @@ func main() {
 			return
 		}
 
-		// 解析 Body
 		var reqBody map[string]string
 		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
@@ -368,10 +393,8 @@ func main() {
 			return
 		}
 
-		// 执行指令
 		io.To("device_room").Emit("command", map[string]string{"cmd": cmd})
 
-		// 记录系统日志
 		sysLog := LogEntry{
 			ID: time.Now().UnixNano(), Time: time.Now(), Type: "system", Msg: "外部接口触发: " + cmd,
 		}
@@ -382,7 +405,6 @@ func main() {
 		w.Write([]byte(`{"success":true}`))
 	})
 
-	// 绑定 Socket.io 到 HTTP
 	http.Handle("/socket.io/", io.ServeHandler(nil))
 
 	log.Printf("Go Server running on port %s", cfg.Port)
@@ -407,7 +429,6 @@ func updateDeviceStatus(updater func(*DeviceStatus)) {
 func addLog(entry LogEntry) {
 	logMutex.Lock()
 	defer logMutex.Unlock()
-	// 插入头部
 	logs = append([]LogEntry{entry}, logs...)
 	if len(logs) > 50 {
 		logs = logs[:50]
@@ -418,10 +439,8 @@ func sendHistoryLogs(s *socket.Socket) {
 	logMutex.RLock()
 	defer logMutex.RUnlock()
 
-	// 倒序发送，保持前端顺序
 	for i := len(logs) - 1; i >= 0; i-- {
 		l := logs[i]
-		// 如果有 R2Key，生成签名 URL
 		if l.R2Key != "" && presignClient != nil {
 			req, err := presignClient.PresignGetObject(context.TODO(), &s3.GetObjectInput{
 				Bucket: aws.String(cfg.R2BucketName),
@@ -441,7 +460,6 @@ func sendHistoryLogs(s *socket.Socket) {
 func uploadToR2(b64 string) string {
 	if s3Client == nil { return "" }
 	
-	// 去除 Header
 	if idx := strings.Index(b64, ","); idx != -1 {
 		b64 = b64[idx+1:]
 	}

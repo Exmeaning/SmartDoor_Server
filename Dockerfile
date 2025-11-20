@@ -3,9 +3,14 @@ FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
-# 复制依赖文件
-COPY go.mod go.sum ./
-RUN go mod download
+# --- 修改开始 ---
+# 1. 只复制 go.mod，因为你可能没有 go.sum
+COPY go.mod ./
+
+# 2. 使用 tidy 自动拉取依赖并生成 go.sum
+# 这一步需要网络，Zeabur 构建环境通常有网络
+RUN go mod tidy
+# --- 修改结束 ---
 
 # 复制源码
 COPY . .

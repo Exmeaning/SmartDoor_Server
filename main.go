@@ -68,7 +68,7 @@ const HTML_CONTENT = `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>智能开门系统 SmartDoor (Go)</title>
+    <title>智能开门系统 SmartDoor by Exmeaning</title>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
@@ -86,7 +86,7 @@ const HTML_CONTENT = `
             <div v-if="!isAuthenticated" class="absolute inset-0 z-50 flex items-center justify-center p-4 bg-bg-dark bg-[url('https://images.unsplash.com/photo-1550751827-4bd374c3f58b?q=80&w=2070')] bg-cover bg-center">
                 <div class="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
                 <div class="relative w-full max-w-md bg-card-dark/90 p-8 rounded-2xl shadow-2xl border border-gray-700 text-center">
-                    <h1 class="text-2xl font-bold text-white mb-2">SmartDoor Go版</h1>
+                    <h1 class="text-2xl font-bold text-white mb-2">SmartDoor</h1>
                     <p class="text-gray-400 text-sm mb-6">请输入访问令牌</p>
                     <div class="space-y-4">
                         <input v-model="inputToken" type="password" placeholder="输入 User Token" class="w-full px-4 py-3 bg-gray-800 border border-gray-600 rounded-lg text-white focus:ring-2 focus:ring-accent-blue outline-none" @keyup.enter="login">

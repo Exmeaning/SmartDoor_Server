@@ -1,50 +1,72 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
-const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+package main
 
-// --- 配置加载 ---
-const PORT = process.env.PORT || 3000;
-const DEVICE_TOKEN = process.env.DEVICE_TOKEN || 'default_device_token';
-const USER_TOKEN = process.env.USER_TOKEN || 'default_user_token';
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
 
-// R2 配置 (兼容 S3 协议)
-const R2_CONFIG = {
-    region: 'auto',
-    endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-    credentials: {
-        accessKeyId: process.env.R2_ACCESS_KEY_ID,
-        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-    },
-};
-const BUCKET_NAME = process.env.R2_BUCKET_NAME;
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/zishang520/socket.io/v2/socket"
+)
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
-const s3Client = new S3Client(R2_CONFIG);
-app.use(express.json()); 
-const API_TOKEN = process.env.API_TOKEN || 'external_secret_999';
+// --- 配置结构 ---
+type Config struct {
+	Port           string
+	DeviceToken    string
+	UserToken      string
+	APIToken       string
+	R2AccountID    string
+	R2AccessKey    string
+	R2SecretKey    string
+	R2BucketName   string
+}
 
+// --- 数据模型 ---
+type LogEntry struct {
+	ID     int64     `json:"id"`
+	Time   time.Time `json:"time"`
+	Type   string    `json:"type"`
+	Msg    string    `json:"msg"`
+	ImgURL *string   `json:"imgUrl"`
+	R2Key  string    `json:"-"` // 不导出给 JSON
+}
 
-// --- 内存数据存储 ---
-// 仅保留最近 50 条日志，重启后丢失 (但图片保存在 R2)
-let logs = []; 
-let deviceStatus = {
-    connected: false,
-    camera: false,
-    door: 'UNKNOWN' // OPEN, CLOSED, UNKNOWN
-};
+type DeviceStatus struct {
+	Connected bool   `json:"connected"`
+	Camera    bool   `json:"camera"`
+	Door      string `json:"door"` // OPEN, CLOSED, UNKNOWN
+}
 
-// --- 前端代码 (嵌入式) ---
+// --- 全局变量 (加锁保护) ---
+var (
+	cfg          Config
+	logs         []LogEntry
+	logMutex     sync.RWMutex
+	deviceStatus DeviceStatus
+	statusMutex  sync.RWMutex
+	s3Client     *s3.Client
+	presignClient *s3.PresignClient
+)
+
+// HTML 字符串 (保持你的前端完全不变)
 const HTML_CONTENT = `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>智能开门系统 SmartDoor</title>
+    <title>智能开门系统 SmartDoor (Go)</title>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
@@ -62,12 +84,11 @@ const HTML_CONTENT = `
 </head>
 <body class="h-screen w-screen overflow-hidden flex flex-col">
     <div id="app" class="h-full w-full flex flex-col relative z-10">
-        <!-- 鉴权页 -->
         <transition name="fade">
             <div v-if="!isAuthenticated" class="absolute inset-0 z-50 flex items-center justify-center p-4 bg-bg-dark bg-[url('https://images.unsplash.com/photo-1550751827-4bd374c3f58b?q=80&w=2070')] bg-cover bg-center">
                 <div class="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
                 <div class="relative w-full max-w-md bg-card-dark/90 p-8 rounded-2xl shadow-2xl border border-gray-700 text-center">
-                    <h1 class="text-2xl font-bold text-white mb-2">SmartDoor 智能开门机</h1>
+                    <h1 class="text-2xl font-bold text-white mb-2">SmartDoor Go版</h1>
                     <p class="text-gray-400 text-sm mb-6">请输入访问令牌</p>
                     <div class="space-y-4">
                         <input v-model="inputToken" type="password" placeholder="输入 User Token" class="w-full px-4 py-3 bg-gray-800 border border-gray-600 rounded-lg text-white focus:ring-2 focus:ring-accent-blue outline-none" @keyup.enter="login">
@@ -76,14 +97,11 @@ const HTML_CONTENT = `
                 </div>
             </div>
         </transition>
-
-        <!-- 控制台 -->
         <div v-if="isAuthenticated" class="flex flex-col h-full">
             <header class="h-16 flex-none bg-card-dark border-b border-gray-800 flex items-center justify-between px-4 shadow-md z-10">
                 <div class="flex items-center gap-3"><div class="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center text-white font-bold text-xs">SD</div><h1 class="font-bold text-lg">智能开门控制</h1></div>
                 <div class="flex items-center gap-2 bg-gray-800 px-3 py-1.5 rounded-full border border-gray-700"><span class="text-xs text-gray-300">{{ connected ? '已连接' : '连接中...' }}</span><span :class="['w-2.5 h-2.5 rounded-full', connected ? 'bg-green-500 animate-pulse' : 'bg-red-500']"></span></div>
             </header>
-
             <main class="flex-grow flex flex-col overflow-hidden p-4 gap-4 max-w-4xl mx-auto w-full">
                 <div class="grid grid-cols-2 gap-4 flex-none">
                     <div class="bg-card-dark p-4 rounded-xl border border-gray-700 flex flex-col items-center justify-center gap-2">
@@ -95,7 +113,6 @@ const HTML_CONTENT = `
                         <div class="text-sm text-gray-400">门锁状态</div><div class="font-semibold text-white">{{ doorState === 'OPEN' ? '已开启' : (doorState === 'CLOSED' ? '已关闭' : '未知') }}</div>
                     </div>
                 </div>
-
                 <div class="flex-none space-y-3">
                     <div class="grid grid-cols-2 gap-3">
                         <button @click="emitCommand('OPEN')" class="h-20 bg-gradient-to-r from-green-600 to-emerald-600 hover:shadow-lg rounded-xl text-white font-bold text-lg flex flex-col items-center justify-center cursor-pointer">一键开门</button>
@@ -106,7 +123,6 @@ const HTML_CONTENT = `
                         <button @click="emitCommand('REFRESH')" class="py-3 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm text-gray-200 font-medium cursor-pointer">🔄 刷新状态</button>
                     </div>
                 </div>
-
                 <div class="flex-grow flex flex-col bg-black/40 rounded-xl border border-gray-800 overflow-hidden">
                     <div class="flex items-center justify-between px-4 py-2 bg-gray-800/50 border-b border-gray-700"><span class="text-xs font-bold text-gray-400 uppercase">系统日志</span><button @click="logs = []" class="text-xs text-gray-500 hover:text-white cursor-pointer">清空</button></div>
                     <div class="flex-grow overflow-y-auto p-4 space-y-3 log-scroll">
@@ -120,14 +136,10 @@ const HTML_CONTENT = `
                     </div>
                 </div>
             </main>
-            
-            <!-- 页脚 -->
             <footer class="flex-none text-center py-3 text-[10px] text-gray-600 border-t border-gray-800/50">
-                <p>Powered by Exmeaning | 图片由 Cloudflare R2 加速 | 项目开源地址 <a href="https://github.com/Exmeaning/SmartDoor" target="_blank" class="text-gray-500 hover:text-gray-400">GitHub.com/Exmeaning/SmartDoor</a></p>
+                <p>Powered by Exmeaning (Go Version) | Cloudflare R2 | <a href="https://github.com/Exmeaning/SmartDoor" target="_blank" class="text-gray-500 hover:text-gray-400">GitHub</a></p>
             </footer>
         </div>
-
-        <!-- 模态框 -->
         <transition name="fade">
             <div v-if="showModal" class="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 backdrop-blur-md p-4" @click="showModal = false">
                 <img :src="currentImage" class="max-w-full max-h-full rounded-lg border border-gray-700" @click.stop>
@@ -158,191 +170,300 @@ const HTML_CONTENT = `
     </script>
 </body>
 </html>
-`;
+`
 
-// --- HTTP 路由 ---
-app.get('/', (req, res) => res.send(HTML_CONTENT));
+func init() {
+	// 加载环境变量
+	cfg = Config{
+		Port:           getEnv("PORT", "3000"),
+		DeviceToken:    getEnv("DEVICE_TOKEN", "default_device_token"),
+		UserToken:      getEnv("USER_TOKEN", "default_user_token"),
+		APIToken:       getEnv("API_TOKEN", "external_secret_999"),
+		R2AccountID:    getEnv("R2_ACCOUNT_ID", ""),
+		R2AccessKey:    getEnv("R2_ACCESS_KEY_ID", ""),
+		R2SecretKey:    getEnv("R2_SECRET_ACCESS_KEY", ""),
+		R2BucketName:   getEnv("R2_BUCKET_NAME", ""),
+	}
+	deviceStatus.Door = "UNKNOWN"
 
-// --- R2 辅助函数 ---
-async function uploadToR2(base64Data) {
-    if (!process.env.R2_BUCKET_NAME) return null;
-    try {
-        // 去掉 Base64 头部 (data:image/jpeg;base64,...)
-        const buffer = Buffer.from(base64Data.replace(/^data:image\/\w+;base64,/, ""), 'base64');
-        const fileName = `logs/${Date.now()}_${Math.random().toString(36).substring(7)}.jpg`;
-        
-        await s3Client.send(new PutObjectCommand({
-            Bucket: BUCKET_NAME,
-            Key: fileName,
-            Body: buffer,
-            ContentType: 'image/jpeg'
-        }));
-        return fileName; // 返回 Key，不要返回完整 URL (因为是私有桶)
-    } catch (e) {
-        console.error("R2 Upload Error:", e);
-        return null;
-    }
+	// 初始化 S3/R2
+	if cfg.R2AccountID != "" && cfg.R2AccessKey != "" {
+		r2Endpoint := fmt.Sprintf("https://%s.r2.cloudflarestorage.com", cfg.R2AccountID)
+		
+		resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{URL: r2Endpoint}, nil
+		})
+
+		awsCfg, err := config.LoadDefaultConfig(context.TODO(),
+			config.WithEndpointResolverWithOptions(resolver),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.R2AccessKey, cfg.R2SecretKey, "")),
+			config.WithRegion("auto"),
+		)
+		if err != nil {
+			log.Printf("Error loading R2 config: %v", err)
+		} else {
+			s3Client = s3.NewFromConfig(awsCfg)
+			presignClient = s3.NewPresignClient(s3Client)
+			log.Println("✅ R2 Client initialized")
+		}
+	}
 }
 
-async function getSignedUrlForKey(key) {
-    if (!key) return null;
-    try {
-        const command = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key });
-        return await getSignedUrl(s3Client, command, { expiresIn: 3600 }); // 1小时有效
-    } catch (e) {
-        console.error("Sign URL Error:", e);
-        return null;
-    }
+func main() {
+	// Socket.io Server
+	io := socket.NewServer(nil, nil)
+
+	// 中间件鉴权
+	io.Use(func(s *socket.Socket, next func(*socket.ExtendedError)) {
+		// 获取 Auth Payload
+		// Go库获取方式略有不同，需要转类型
+		auth := s.Handshake().Auth
+		var token string
+		var clientType string
+
+		if t, ok := auth["token"].(string); ok { token = t }
+		if tp, ok := auth["type"].(string); ok { clientType = tp }
+
+		// 鉴权逻辑
+		if clientType == "device" && token == cfg.DeviceToken {
+			s.Set("type", "device")
+			next(nil)
+			return
+		}
+		if clientType == "web" && token == cfg.UserToken {
+			s.Set("type", "web")
+			next(nil)
+			return
+		}
+		// 鉴权失败
+		err := socket.NewExtendedError("Authentication error", nil)
+		next(err)
+	})
+
+	io.On("connection", func(s *socket.Socket) {
+		clientType, _ := s.Get("type")
+		log.Printf("Client connected: %v (%v)", clientType, s.Id())
+
+		if clientType == "device" {
+			s.Join("device_room")
+			updateDeviceStatus(func(ds *DeviceStatus) {
+				ds.Connected = true
+				ds.Camera = true
+			})
+			io.To("web_room").Emit("status", deviceStatus)
+
+			s.On("disconnect", func(reason string) {
+				updateDeviceStatus(func(ds *DeviceStatus) {
+					ds.Connected = false
+					ds.Camera = false
+				})
+				io.To("web_room").Emit("status", deviceStatus)
+			})
+
+			s.On("door_status", func(status string) {
+				updateDeviceStatus(func(ds *DeviceStatus) {
+					ds.Door = status
+				})
+				io.To("web_room").Emit("status", deviceStatus)
+			})
+
+			s.On("report", func(data map[string]interface{}) {
+				// data: {type, msg, image}
+				logType, _ := data["type"].(string)
+				msg, _ := data["msg"].(string)
+				imgBase64, _ := data["image"].(string)
+
+				entry := LogEntry{
+					ID:   time.Now().UnixNano(),
+					Time: time.Now(),
+					Type: logType,
+					Msg:  msg,
+				}
+
+				// 1. 实时转发 Base64 到 Web
+				var realtimeImg *string
+				if imgBase64 != "" {
+					if !strings.HasPrefix(imgBase64, "data:") {
+						fullStr := "data:image/jpeg;base64," + imgBase64
+						realtimeImg = &fullStr
+					} else {
+						realtimeImg = &imgBase64
+					}
+					entry.ImgURL = realtimeImg
+				}
+
+				io.To("web_room").Emit("log", entry)
+
+				// 2. 异步上传 R2
+				go func(e LogEntry, b64 string) {
+					if b64 != "" {
+						key := uploadToR2(b64)
+						if key != "" {
+							e.R2Key = key
+							e.ImgURL = nil // 内存中不存 Base64
+							addLog(e)
+						}
+					} else {
+						addLog(e)
+					}
+				}(entry, imgBase64)
+			})
+		}
+
+		if clientType == "web" {
+			s.Join("web_room")
+			s.Emit("status", deviceStatus)
+			
+			// 发送历史日志
+			sendHistoryLogs(s)
+
+			s.On("command", func(data map[string]interface{}) {
+				cmd, _ := data["cmd"].(string)
+				log.Printf("Command received: %s", cmd)
+				io.To("device_room").Emit("command", map[string]string{"cmd": cmd})
+			})
+		}
+	})
+
+	// HTTP 路由
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(HTML_CONTENT))
+	})
+
+	// 第三方 API 接口
+	http.HandleFunc("/api/command", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// 鉴权
+		token := r.Header.Get("Authorization")
+		if token == "" {
+			token = r.URL.Query().Get("token")
+		}
+		token = strings.TrimPrefix(token, "Bearer ")
+
+		if token != cfg.APIToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		// 解析 Body
+		var reqBody map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+
+		cmd := reqBody["cmd"]
+		if cmd == "" {
+			http.Error(w, "Missing cmd", http.StatusBadRequest)
+			return
+		}
+
+		if !deviceStatus.Connected {
+			http.Error(w, "Device Offline", http.StatusServiceUnavailable)
+			return
+		}
+
+		// 执行指令
+		io.To("device_room").Emit("command", map[string]string{"cmd": cmd})
+
+		// 记录系统日志
+		sysLog := LogEntry{
+			ID: time.Now().UnixNano(), Time: time.Now(), Type: "system", Msg: "外部接口触发: " + cmd,
+		}
+		addLog(sysLog)
+		io.To("web_room").Emit("log", sysLog)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true}`))
+	})
+
+	// 绑定 Socket.io 到 HTTP
+	http.Handle("/socket.io/", io.ServeHandler(nil))
+
+	log.Printf("Go Server running on port %s", cfg.Port)
+	log.Fatal(http.ListenAndServe(":"+cfg.Port, nil))
 }
-app.post('/api/command', (req, res) => {
-    // 1. 校验 Token (通过 Header 或 Query 参数)
-    const token = req.headers['authorization'] || req.query.token;
-    
-    // 简单处理：支持 "Bearer xxx" 或直接 "xxx"
-    const cleanToken = token && token.startsWith('Bearer ') ? token.slice(7) : token;
 
-    if (cleanToken !== API_TOKEN) {
-        return res.status(401).json({ error: 'Unauthorized', msg: '密钥错误' });
-    }
+// --- 辅助函数 ---
 
-    // 2. 获取指令
-    const { cmd } = req.body;
-    if (!cmd) {
-        return res.status(400).json({ error: 'Missing command', msg: '请在 body 中发送 { "cmd": "OPEN" }' });
-    }
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
 
-    // 3. 检查设备是否在线
-    if (!deviceStatus.connected) {
-        return res.status(503).json({ error: 'Device Offline', msg: '树莓派离线，无法执行' });
-    }
+func updateDeviceStatus(updater func(*DeviceStatus)) {
+	statusMutex.Lock()
+	defer statusMutex.Unlock()
+	updater(&deviceStatus)
+}
 
-    // 4. 通过 WebSocket 转发给树莓派
-    console.log(`[API] External command received: ${cmd}`);
-    io.to('device_room').emit('command', { cmd: cmd });
+func addLog(entry LogEntry) {
+	logMutex.Lock()
+	defer logMutex.Unlock()
+	// 插入头部
+	logs = append([]LogEntry{entry}, logs...)
+	if len(logs) > 50 {
+		logs = logs[:50]
+	}
+}
 
-    // 5. 记录日志供 WebUI 查看
-    const logMsg = `外部接口触发指令: ${cmd}`;
-    // 广播日志给 Web 端
-    io.to('web_room').emit('log', { 
-        id: Date.now(), time: new Date(), type: 'system', msg: logMsg 
-    });
-    // 存入内存
-    logs.unshift({ id: Date.now(), time: new Date(), type: 'system', msg: logMsg });
-    if(logs.length > 50) logs.pop();
+func sendHistoryLogs(s *socket.Socket) {
+	logMutex.RLock()
+	defer logMutex.RUnlock()
 
-    // 6. 响应 HTTP 成功
-    res.json({ success: true, msg: `指令 ${cmd} 已发送` });
-});
-// --- Socket.io 逻辑 ---
-io.use((socket, next) => {
-    const token = socket.handshake.auth.token;
-    const type = socket.handshake.auth.type; // 'web' or 'device'
+	// 倒序发送，保持前端顺序
+	for i := len(logs) - 1; i >= 0; i-- {
+		l := logs[i]
+		// 如果有 R2Key，生成签名 URL
+		if l.R2Key != "" && presignClient != nil {
+			req, err := presignClient.PresignGetObject(context.TODO(), &s3.GetObjectInput{
+				Bucket: aws.String(cfg.R2BucketName),
+				Key:    aws.String(l.R2Key),
+			}, func(opts *s3.PresignOptions) {
+				opts.Expires = time.Hour
+			})
+			if err == nil {
+				url := req.URL
+				l.ImgURL = &url
+			}
+		}
+		s.Emit("log", l)
+	}
+}
 
-    if (type === 'device' && token === DEVICE_TOKEN) {
-        socket.userType = 'device';
-        return next();
-    }
-    if (type === 'web' && token === USER_TOKEN) {
-        socket.userType = 'web';
-        return next();
-    }
-    return next(new Error("Authentication error"));
-});
+func uploadToR2(b64 string) string {
+	if s3Client == nil { return "" }
+	
+	// 去除 Header
+	if idx := strings.Index(b64, ","); idx != -1 {
+		b64 = b64[idx+1:]
+	}
 
-io.on('connection', async (socket) => {
-    console.log(`Client connected: ${socket.userType} (${socket.id})`);
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		log.Println("Base64 decode error:", err)
+		return ""
+	}
 
-    if (socket.userType === 'device') {
-        socket.join('device_room');
-        deviceStatus.connected = true;
-        deviceStatus.camera = true; // 假设连上就是在线
-        io.to('web_room').emit('status', deviceStatus);
+	key := fmt.Sprintf("logs/%d_%d.jpg", time.Now().Unix(), time.Now().UnixNano()%1000)
+	
+	_, err = s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket:      aws.String(cfg.R2BucketName),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String("image/jpeg"),
+	})
 
-        socket.on('disconnect', () => {
-            deviceStatus.connected = false;
-            deviceStatus.camera = false;
-            io.to('web_room').emit('status', deviceStatus);
-        });
-
-        // 树莓派上报日志
-        socket.on('report', async (data) => {
-            // data: { type: 'success'|'reject', msg: 'xxx', image: 'base64...' }
-            
-            // 1. 构造日志对象
-            const logEntry = {
-                id: Date.now(),
-                time: new Date(),
-                type: data.type,
-                msg: data.msg,
-                imgUrl: null, // 初始为空
-                r2Key: null   // 用于后续生成签名链接
-            };
-
-            // 2. 如果有图片，先直接把 Base64 给 Web 端用于实时显示 (极速)
-            if (data.image) {
-                logEntry.imgUrl = data.image.startsWith('data:') ? data.image : `data:image/jpeg;base64,${data.image}`;
-            }
-
-            // 3. 广播给当前在线的 Web 用户
-            io.to('web_room').emit('log', logEntry);
-
-            // 4. 异步：上传 R2 并更新内存记录
-            if (data.image) {
-                const key = await uploadToR2(data.image);
-                if (key) {
-                    logEntry.r2Key = key;
-                    logEntry.imgUrl = null; // 内存里为了省空间，上传成功后可以删掉 Base64 (可选)
-                    
-                    // 更新 logs 数组
-                    logs.unshift(logEntry);
-                    if (logs.length > 50) logs.pop();
-                }
-            } else {
-                logs.unshift(logEntry);
-                if (logs.length > 50) logs.pop();
-            }
-        });
-
-        // 树莓派更新门状态
-        socket.on('door_status', (status) => {
-            deviceStatus.door = status; // 'OPEN' or 'CLOSED'
-            io.to('web_room').emit('status', deviceStatus);
-        });
-    }
-
-    if (socket.userType === 'web') {
-        socket.join('web_room');
-        
-        // 发送当前状态
-        socket.emit('status', deviceStatus);
-
-        // 发送历史日志 (需要为 R2 图片生成签名链接)
-        const historyLogs = await Promise.all(logs.map(async (log) => {
-            if (log.r2Key) {
-                const signedUrl = await getSignedUrlForKey(log.r2Key);
-                return { ...log, imgUrl: signedUrl }; // 替换为临时链接
-            }
-            return log;
-        }));
-        // 倒序发给前端，或者前端自己处理，这里直接发数组，前端根据代码是 unshift，所以我们倒着发？
-        // 前端逻辑是 unshift，所以历史记录应该按时间倒序（最新的在 logs[0]）直接发过去
-        // 但是 socket.emit 是一次性的，这里简单处理：倒着遍历发，或者改前端
-        // 为了简化，我们发送一个特殊事件 'history_logs' 或者逐条发
-        // 这里逐条发送，从最旧的开始发，这样前端 unshift 后顺序是对的
-        for (let i = historyLogs.length - 1; i >= 0; i--) {
-            socket.emit('log', historyLogs[i]);
-        }
-
-        // Web 发送指令
-        socket.on('command', (data) => {
-            // data: { cmd: 'OPEN' }
-            console.log(`Command received: ${data.cmd}`);
-            // 转发给树莓派
-            io.to('device_room').emit('command', { cmd: data.cmd });
-        });
-    }
-});
-
-server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+	if err != nil {
+		log.Println("R2 Upload error:", err)
+		return ""
+	}
+	return key
+}

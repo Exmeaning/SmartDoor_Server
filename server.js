@@ -67,7 +67,7 @@ const HTML_CONTENT = `
             <div v-if="!isAuthenticated" class="absolute inset-0 z-50 flex items-center justify-center p-4 bg-bg-dark bg-[url('https://images.unsplash.com/photo-1550751827-4bd374c3f58b?q=80&w=2070')] bg-cover bg-center">
                 <div class="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
                 <div class="relative w-full max-w-md bg-card-dark/90 p-8 rounded-2xl shadow-2xl border border-gray-700 text-center">
-                    <h1 class="text-2xl font-bold text-white mb-2">SmartDoor 智能门禁</h1>
+                    <h1 class="text-2xl font-bold text-white mb-2">SmartDoor 智能开门机</h1>
                     <p class="text-gray-400 text-sm mb-6">请输入访问令牌</p>
                     <div class="space-y-4">
                         <input v-model="inputToken" type="password" placeholder="输入 User Token" class="w-full px-4 py-3 bg-gray-800 border border-gray-600 rounded-lg text-white focus:ring-2 focus:ring-accent-blue outline-none" @keyup.enter="login">
@@ -80,7 +80,7 @@ const HTML_CONTENT = `
         <!-- 控制台 -->
         <div v-if="isAuthenticated" class="flex flex-col h-full">
             <header class="h-16 flex-none bg-card-dark border-b border-gray-800 flex items-center justify-between px-4 shadow-md z-10">
-                <div class="flex items-center gap-3"><div class="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center text-white font-bold text-xs">SD</div><h1 class="font-bold text-lg">智能门禁控制</h1></div>
+                <div class="flex items-center gap-3"><div class="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center text-white font-bold text-xs">SD</div><h1 class="font-bold text-lg">智能开门控制</h1></div>
                 <div class="flex items-center gap-2 bg-gray-800 px-3 py-1.5 rounded-full border border-gray-700"><span class="text-xs text-gray-300">{{ connected ? '已连接' : '连接中...' }}</span><span :class="['w-2.5 h-2.5 rounded-full', connected ? 'bg-green-500 animate-pulse' : 'bg-red-500']"></span></div>
             </header>
 
